@@ -62,7 +62,7 @@ def rows(data, key):
 
 
 def market_label(m):
-    for key in ('name', 'label', 'title', 'display_name', 'slug', 'key'):
+    for key in ('stat','name', 'label', 'title', 'display_name', 'slug', 'key'):
         if isinstance(m.get(key), str) and m[key].strip(): return m[key]
     return ''
 
