@@ -8,16 +8,17 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlsplit, parse_qsl
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 KALSHI = 'https://external-api.kalshi.com/trade-api/v2'
 BP = 'https://api.bettingpros.com/v3'
 SPORTS = ('NBA', 'NFL', 'MLB', 'NHL')
 UTC = dt.timezone.utc
 
-MAX_KALSHI_PAGES = 100
-BP_PROP_LIMIT = 100
+MAX_KALSHI_PAGES = 10
+MAX_BP_PAGES = 30
 BUFFER = .03
 MIN_EDGE = .05
 
@@ -26,7 +27,7 @@ def fetch(url, headers=None):
     for attempt in range(3):
         try:
             req = Request(url, headers={
-                'User-Agent': 'KalshiResearchDashboard/5.0',
+                'User-Agent': 'KalshiResearchDashboard/6.0',
                 **(headers or {})
             })
             with urlopen(req, timeout=35) as res:
@@ -38,7 +39,7 @@ def fetch(url, headers=None):
 
 
 def safe_error(ex):
-    # Never publish headers, credentials, or response bodies.
+    # Never publish request headers, credentials, or response bodies.
     if isinstance(ex, HTTPError):
         return 'HTTP ' + str(ex.code)
     return type(ex).__name__
@@ -46,10 +47,7 @@ def safe_error(ex):
 
 def norm(value):
     value = unicodedata.normalize('NFKD', str(value or ''))
-    value = ''.join(
-        c for c in value
-        if not unicodedata.combining(c)
-    )
+    value = ''.join(c for c in value if not unicodedata.combining(c))
     return re.sub(r'[^a-z0-9]+', ' ', value.lower()).strip()
 
 
@@ -64,25 +62,16 @@ def number(value):
 def rows(data, key):
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
-
     if not isinstance(data, dict):
         return []
 
-    for value in (
-        data.get(key),
-        data.get('data'),
-        data.get('results')
-    ):
+    for value in (data.get(key), data.get('data'), data.get('results')):
         if isinstance(value, list):
             return [r for r in value if isinstance(r, dict)]
-
         if isinstance(value, dict):
             nested = value.get(key) or value.get('items')
             if isinstance(nested, list):
-                return [
-                    r for r in nested
-                    if isinstance(r, dict)
-                ]
+                return [r for r in nested if isinstance(r, dict)]
     return []
 
 
@@ -90,16 +79,13 @@ ALIASES = {
     'points': ('points', 'pts'),
     'rebounds': ('rebounds', 'reb'),
     'assists': ('assists', 'ast'),
-    'strikeouts': (
-        'strikeouts', 'strikeout', 'pitcher ks'
-    ),
+    'strikeouts': ('strikeouts', 'strikeout', 'pitcher ks'),
     'receptions': ('receptions', 'catches'),
     'passing yards': ('passing yards', 'pass yards'),
     'receiving yards': ('receiving yards', 'rec yards'),
     'rushing yards': ('rushing yards', 'rush yards'),
     'three pointers': (
-        'three pointers', 'three point',
-        '3 pointers', '3pt', 'threes'
+        'three pointers', 'three point', '3 pointers', '3pt', 'threes'
     ),
     'hits': ('hits',),
     'home runs': ('home runs', 'homeruns'),
@@ -128,6 +114,22 @@ BP_CODES = {
     },
 }
 
+SERIES = {
+    'NBA': (
+        'KXNBAPTS', 'KXNBAREB', 'KXNBAAST', 'KXNBA3PT'
+    ),
+    'NFL': (
+        'KXNFLPASSYDS', 'KXNFLRECYDS', 'KXNFLRSHYDS', 'KXNFLREC'
+    ),
+    'MLB': (
+        'KXMLBHIT', 'KXMLBTB', 'KXMLBSB', 'KXMLBKS'
+    ),
+    'NHL': (
+        'KXNHLAST', 'KXNHLSAVES', 'KXNHLSAVE',
+        'KXNHLGOAL', 'KXNHLANYGOAL'
+    ),
+}
+
 
 def market_label(m, sport=None):
     for key in (
@@ -145,7 +147,7 @@ def market_label(m, sport=None):
 def stat_type(value):
     text = norm(value)
 
-    # Reject combined hits/runs/RBIs as a hits-only market.
+    # Do not treat combined stats as one of their components.
     if 'hits' in text and ('runs' in text or 'rbis' in text):
         return None
 
@@ -156,7 +158,6 @@ def stat_type(value):
             for a in aliases
         )
     ]
-
     return matches[0] if len(matches) == 1 else None
 
 
@@ -165,9 +166,7 @@ def prop_label(p, mapping, sport):
         mapping.get((sport, str(p.get('market_id'))), '')
     ]
 
-    for key in (
-        'market_name', 'market_label', 'stat_type', 'stat'
-    ):
+    for key in ('market_name', 'market_label', 'stat_type', 'stat'):
         value = p.get(key)
         if isinstance(value, str):
             values.append(
@@ -208,124 +207,165 @@ def threshold_matches(label, line):
         r'(?<![\d.])' + n + r'\s+or more\b',
         r'\b(?:over|more than)\s+' + half + r'(?![\d.])',
     )
+    return any(re.search(p, label, re.I) for p in patterns)
 
-    return any(
-        re.search(pattern, label, re.I)
-        for pattern in patterns
+
+def bp_next(current, endpoint, pagination):
+    nxt = pagination.get('next')
+    if not nxt:
+        return None
+
+    if not isinstance(nxt, str):
+        raise ValueError('Unsupported pagination format')
+
+    target = urlsplit(urljoin(current, nxt))
+
+    if (
+        target.scheme != 'https'
+        or target.netloc != 'api.bettingpros.com'
+        or target.path.rstrip('/') != '/v3/' + endpoint
+    ):
+        raise ValueError('Unexpected pagination destination')
+
+    # Never copy credentials from pagination URLs.
+    # Authentication is supplied through the header only.
+    allowed = {
+        'sport', 'page', 'limit', 'per_page',
+        'market_id', 'event_id', 'date', 'season'
+    }
+    params = [
+        (k, v)
+        for k, v in parse_qsl(target.query)
+        if k in allowed
+    ]
+
+    return BP + '/' + endpoint + '?' + urlencode(params)
+
+
+def bp_pages(endpoint, sport, headers):
+    url = BP + '/' + endpoint + '?' + urlencode({
+        'sport': sport,
+        'limit': 100
+    })
+
+    result = []
+    seen = set()
+    fingerprints = set()
+    info = {
+        'pages': 0,
+        'items': 0,
+        'more_pages': False
+    }
+
+    for _ in range(MAX_BP_PAGES):
+        if url in seen:
+            info['error'] = 'Repeated page URL'
+            break
+
+        seen.add(url)
+
+        try:
+            data = fetch(url, headers)
+            batch = rows(data, endpoint)
+            fingerprint = json.dumps(batch, sort_keys=True)
+
+            if batch and fingerprint in fingerprints:
+                info['error'] = 'Repeated page content'
+                break
+
+            fingerprints.add(fingerprint)
+            result.extend(batch)
+            info['pages'] += 1
+
+            pagination = (
+                data.get('_pagination', {})
+                if isinstance(data, dict)
+                else {}
+            )
+            if not isinstance(pagination, dict):
+                pagination = {}
+
+            for field in ('total_pages', 'total_items', 'limit'):
+                value = number(pagination.get(field))
+                if value is not None:
+                    info[field] = int(value)
+
+            info['more_pages'] = bool(pagination.get('next'))
+            url = bp_next(url, endpoint, pagination)
+
+            if not url:
+                break
+
+        except Exception as ex:
+            info['error'] = safe_error(ex)
+            info['more_pages'] = True
+            break
+
+    info['items'] = len(result)
+
+    if (
+        'total_items' in info
+        and info['items'] < info['total_items']
+    ):
+        info['more_pages'] = True
+
+    return result, info
+
+
+def scheduled_date(m):
+    # Use the explicit date in settlement rules.
+    # A contract's closing deadline is not the game date.
+    rules = (
+        str(m.get('rules_primary') or '')
+        + ' '
+        + str(m.get('rules_secondary') or '')
     )
+
+    found = re.findall(
+        r'originally scheduled for\s+'
+        r'([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})',
+        rules,
+        re.I
+    )
+
+    dates = set()
+
+    for month, day, year in found:
+        for fmt in ('%b %d %Y', '%B %d %Y'):
+            try:
+                value = dt.datetime.strptime(
+                    month + ' ' + day + ' ' + year,
+                    fmt
+                ).date()
+                dates.add(value)
+                break
+            except ValueError:
+                pass
+
+    return next(iter(dates)) if len(dates) == 1 else None
 
 
 def main():
     now = dt.datetime.now(UTC)
+    today = now.astimezone(
+        ZoneInfo('America/New_York')
+    ).date()
+
     rejected = Counter()
     stats = Counter()
     unknown = Counter()
 
     debug = {
-        'rejections': {},
         'sports': {},
-        'unknown_stat_labels': {}
+        'series': {},
+        'time_examples': []
     }
 
-    out = {
-        'updated_utc': now.isoformat(),
-        'kalshi': {
-            'status': 'unavailable',
-            'markets': [],
-            'market_count': 0
-        },
-        'bettingpros': {
-            'status': 'not_configured'
-        },
-        'scanner': {
-            'status': 'insufficient_data',
-            'review': [],
-            'scanned_props': 0,
-            'usable_projections': 0,
-            'stats_identified': 0,
-            'matches_checked': 0
-        }
-    }
-
-    scanner = out['scanner']
+    errors = []
+    props = []
+    mapping = {}
     markets = []
-    cursor = None
-    pages = 0
-    kalshi_error = None
-    seen_cursors = set()
 
-    try:
-        for _ in range(MAX_KALSHI_PAGES):
-            params = {
-                'status': 'open',
-                'limit': 1000,
-                'mve_filter': 'exclude'
-            }
-            if cursor:
-                params['cursor'] = cursor
-
-            data = fetch(
-                KALSHI + '/markets?' + urlencode(params)
-            )
-            markets.extend(rows(data, 'markets'))
-            pages += 1
-
-            cursor = (
-                data.get('cursor')
-                if isinstance(data, dict)
-                else None
-            )
-
-            if not cursor:
-                break
-
-            if cursor in seen_cursors:
-                kalshi_error = 'Repeated pagination cursor'
-                break
-
-            seen_cursors.add(cursor)
-
-    except Exception as ex:
-        kalshi_error = safe_error(ex)
-
-    markets = list({
-        m['ticker']: m
-        for m in markets
-        if m.get('ticker')
-    }.values())
-
-    fields = (
-        'ticker', 'event_ticker', 'title', 'subtitle',
-        'yes_sub_title', 'yes_bid_dollars', 'yes_ask_dollars',
-        'no_bid_dollars', 'no_ask_dollars',
-        'volume_fp', 'close_time'
-    )
-
-    out['kalshi'] = {
-        'status': (
-            'partial' if markets and kalshi_error
-            else 'ok' if markets
-            else 'unavailable'
-        ),
-        'market_count': len(markets),
-        'pages_loaded': pages,
-        'more_pages': bool(cursor) or bool(kalshi_error),
-        'markets': [
-            {k: m.get(k) for k in fields}
-            for m in markets
-        ]
-    }
-
-    if kalshi_error:
-        out['kalshi']['error'] = kalshi_error
-
-    # Normalize market text once for the entire scan.
-    indexed = [
-        (m, market_text(m), norm(market_text(m)))
-        for m in markets
-    ]
-
-    props, mapping, errors = [], {}, []
     key = os.getenv('BETTINGPROS_API_KEY', '').strip()
     success = 0
 
@@ -333,76 +373,119 @@ def main():
         headers = {'x-api-key': key}
 
         for sport in SPORTS:
-            info = {
-                'props_loaded': 0,
-                'markets_loaded': 0
-            }
-            debug['sports'][sport] = info
+            found, pinfo = bp_pages('props', sport, headers)
+            definitions, minfo = bp_pages(
+                'markets', sport, headers
+            )
 
-            for endpoint, limit in (
-                ('props', BP_PROP_LIMIT),
-                ('markets', 200)
-            ):
-                try:
-                    data = fetch(
-                        BP + '/' + endpoint + '?' + urlencode({
-                            'sport': sport,
-                            'limit': limit
-                        }),
-                        headers
+            debug['sports'][sport] = {
+                'props': pinfo,
+                'markets': minfo
+            }
+
+            if pinfo['pages']:
+                success += 1
+
+            props.extend((sport, p) for p in found)
+
+            for definition in definitions:
+                mid = definition.get('id')
+                if mid is None:
+                    mid = definition.get('market_id')
+
+                if mid is not None:
+                    mapping[(sport, str(mid))] = market_label(
+                        definition, sport
                     )
 
-                    found = rows(data, endpoint)
-                    info[endpoint + '_loaded'] = len(found)
+            for endpoint, info in (
+                ('props', pinfo),
+                ('markets', minfo)
+            ):
+                if info.get('error'):
+                    errors.append(
+                        sport + ' ' + endpoint + ': '
+                        + info['error']
+                    )
 
-                    # Record field names without exposing raw payloads.
-                    # BettingPros coverage remains sampled until its
-                    # pagination scheme is verified.
-                    pagination = (
-                        data.get('_pagination')
+    incomplete = False
+
+    for sport, tickers in SERIES.items():
+        for ticker in tickers:
+            cursor = None
+            seen = set()
+
+            info = {
+                'pages': 0,
+                'items': 0,
+                'more_pages': False
+            }
+            debug['series'][ticker] = info
+
+            try:
+                for _ in range(MAX_KALSHI_PAGES):
+                    params = {
+                        'series_ticker': ticker,
+                        'status': 'open',
+                        'limit': 1000,
+                        'mve_filter': 'exclude'
+                    }
+                    if cursor:
+                        params['cursor'] = cursor
+
+                    data = fetch(
+                        KALSHI + '/markets?' + urlencode(params)
+                    )
+                    batch = rows(data, 'markets')
+                    markets.extend((sport, m) for m in batch)
+
+                    info['pages'] += 1
+                    info['items'] += len(batch)
+
+                    cursor = (
+                        data.get('cursor')
                         if isinstance(data, dict)
                         else None
                     )
-                    info[endpoint + '_pagination_fields'] = (
-                        sorted(pagination)
-                        if isinstance(pagination, dict)
-                        else []
-                    )
+                    info['more_pages'] = bool(cursor)
 
-                    if endpoint == 'props':
-                        success += 1
-                        props.extend((sport, p) for p in found)
-                    else:
-                        for m in found:
-                            mid = (
-                                m.get('id')
-                                if m.get('id') is not None
-                                else m.get('market_id')
-                            )
-                            if mid is not None:
-                                mapping[(sport, str(mid))] = (
-                                    market_label(m, sport)
-                                )
+                    if not cursor:
+                        break
 
-                except Exception as ex:
-                    errors.append(
-                        sport + ' ' + endpoint + ': '
-                        + safe_error(ex)
-                    )
+                    if cursor in seen:
+                        raise ValueError('Repeated cursor')
 
-        out['bettingpros'] = {
-            'status': (
-                'connected'
-                if success
-                else 'connection_error'
-            ),
-            'successful_queries': success,
-            'market_labels': len(mapping),
-            'errors': errors
-        }
+                    seen.add(cursor)
 
-    scanner['scanned_props'] = len(props)
-    name_hits = 0
+            except Exception as ex:
+                info['error'] = safe_error(ex)
+                info['more_pages'] = True
+
+            incomplete = incomplete or info['more_pages']
+
+    markets = list({
+        m['ticker']: (sport, m)
+        for sport, m in markets
+        if m.get('ticker')
+    }.values())
+
+    indexed = {}
+    for sport, m in markets:
+        indexed.setdefault(sport, []).append((
+            m,
+            market_text(m),
+            norm(market_text(m))
+        ))
+
+    scanner = {
+        'status': 'insufficient_data',
+        'review': [],
+        'scanned_props': len(props),
+        'usable_projections': 0,
+        'stats_identified': 0,
+        'matches_checked': 0
+    }
+
     review = []
 
     for sport, p in props:
@@ -430,15 +513,15 @@ def main():
         stat = stat_type(label)
 
         if not stat:
-            rejected['prop_unknown_stat'] += 1
             unknown[
                 sport + ': '
                 + (label[:80] or '(unmapped market ID)')
             ] += 1
+            rejected['prop_unknown_stat'] += 1
             continue
 
-        stats[stat] += 1
         scanner['stats_identified'] += 1
+        stats[stat] += 1
 
         participant = p.get('participant')
         player = (
@@ -447,16 +530,16 @@ def main():
             else ''
         )
 
-        if len(player.split()) < 2:
-            rejected['prop_missing_player_name'] += 1
-            continue
-
         over = p.get('over')
         line = (
             number(over.get('line'))
             if isinstance(over, dict)
             else None
         )
+
+        if len(player.split()) < 2:
+            rejected['prop_missing_name'] += 1
+            continue
 
         if (
             line is None
@@ -468,13 +551,12 @@ def main():
         pattern = re.compile(
             r'\b' + re.escape(player) + r'\b'
         )
+
         candidates = [
             (m, raw)
-            for m, raw, text in indexed
+            for m, raw, text in indexed.get(sport, [])
             if pattern.search(text)
         ]
-
-        name_hits += len(candidates)
 
         if not candidates:
             rejected['prop_no_player_overlap'] += 1
@@ -485,12 +567,31 @@ def main():
                 continue
 
             if not threshold_matches(raw, line):
-                rejected[
-                    'contract_threshold_or_direction_mismatch'
-                ] += 1
+                rejected['contract_threshold_mismatch'] += 1
                 continue
 
             scanner['matches_checked'] += 1
+            game_date = scheduled_date(m)
+
+            if len(debug['time_examples']) < 8:
+                debug['time_examples'].append({
+                    'ticker': m.get('ticker'),
+                    'scheduled_date': str(game_date),
+                    'close_time': m.get('close_time'),
+                    'expected_expiration_time': m.get(
+                        'expected_expiration_time'
+                    )
+                })
+
+            if game_date is None:
+                rejected[
+                    'contract_scheduled_date_unverified'
+                ] += 1
+                continue
+
+            if game_date != today:
+                rejected['contract_not_scheduled_today'] += 1
+                continue
 
             try:
                 close = dt.datetime.fromisoformat(
@@ -498,18 +599,12 @@ def main():
                         'Z', '+00:00'
                     )
                 )
-                if close.tzinfo is None:
-                    raise ValueError('Missing timezone')
+                if close.tzinfo is None or close <= now:
+                    raise ValueError('Closed or invalid deadline')
             except (TypeError, ValueError):
-                rejected['contract_invalid_close_time'] += 1
-                continue
-
-            if close <= now:
-                rejected['contract_already_closed'] += 1
-                continue
-
-            if close > now + dt.timedelta(hours=30):
-                rejected['contract_beyond_30_hours'] += 1
+                rejected[
+                    'contract_closed_or_invalid_deadline'
+                ] += 1
                 continue
 
             p_over = (
@@ -533,9 +628,7 @@ def main():
                 edge = p_side - price - BUFFER
 
                 if edge <= MIN_EDGE:
-                    rejected[
-                        'side_edge_not_above_5_percent_after_buffer'
-                    ] += 1
+                    rejected['side_edge_below_requirement'] += 1
                     continue
 
                 review.append({
@@ -546,6 +639,7 @@ def main():
                     'model_probability': round(p_side, 4),
                     'edge_after_buffer': round(edge, 4),
                     'close_time': m.get('close_time'),
+                    'scheduled_game_date': game_date.isoformat(),
                     'volume': m.get('volume_fp'),
                     'match': {
                         'player': player,
@@ -554,8 +648,8 @@ def main():
                         'threshold': math.floor(line) + 1
                     },
                     'warning': (
-                        'UNVERIFIED: event identity/date, period, '
-                        'settlement, live ask and fees require review.'
+                        'UNVERIFIED cross-provider game identity/date '
+                        'and period. Check rules, live price and fees.'
                     )
                 })
 
@@ -578,18 +672,14 @@ def main():
     debug.update({
         'rejections': dict(rejected),
         'stat_counts': dict(stats),
-        'unknown_stat_labels': dict(unknown.most_common(20)),
-        'player_name_matches': name_hits,
-        'kalshi_pages': pages
+        'unknown_stat_labels': dict(unknown.most_common(25))
     })
     scanner['debug'] = debug
 
     summary = (
-        'Research candidates found; event and settlement NOT verified.'
-        if unique else
-        'Label matches found, but none passed time/price/edge filters.'
-        if scanner['matches_checked'] else
-        'No exact player/stat/threshold label matches found.'
+        'Research candidates require event/period verification.'
+        if unique
+        else 'No candidate passed this scan.'
     )
 
     if not key:
@@ -597,9 +687,42 @@ def main():
 
     scanner['diagnostic'] = (
         summary
-        + ' Rejection counts: '
+        + ' Rejections: '
         + json.dumps(dict(rejected), sort_keys=True)
     )
+
+    fields = (
+        'ticker', 'event_ticker', 'title', 'subtitle',
+        'yes_sub_title', 'yes_bid_dollars', 'yes_ask_dollars',
+        'no_bid_dollars', 'no_ask_dollars', 'volume_fp',
+        'close_time', 'expected_expiration_time'
+    )
+
+    out = {
+        'updated_utc': now.isoformat(),
+        'version': 6,
+        'kalshi': {
+            'status': 'partial' if incomplete else 'ok',
+            'market_count': len(markets),
+            'more_pages': incomplete,
+            'scope': 'Selected single-game player-prop series',
+            'markets': [
+                {k: m.get(k) for k in fields}
+                for _, m in markets
+            ]
+        },
+        'bettingpros': {
+            'status': (
+                'connected' if success
+                else 'connection_error' if key
+                else 'not_configured'
+            ),
+            'successful_queries': success,
+            'market_labels': len(mapping),
+            'errors': errors
+        },
+        'scanner': scanner
+    }
 
     Path('data').mkdir(exist_ok=True)
     Path('data/latest.json').write_text(
@@ -608,10 +731,7 @@ def main():
     )
 
     print(
-        'Kalshi:', out['kalshi']['status'],
-        len(markets),
-        'pages:', pages,
-        'more pages:', out['kalshi']['more_pages'],
+        'Kalshi:', len(markets),
         'BettingPros:', out['bettingpros']['status']
     )
     print(
