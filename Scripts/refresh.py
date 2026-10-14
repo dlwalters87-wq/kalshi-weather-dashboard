@@ -41,7 +41,7 @@ def main():
         # Test the documented authenticated endpoint. Keep premium data PRIVATE: public
         # GitHub Pages and the repository must not redistribute subscription content.
         try:
-            data = fetch(BETTINGPROS + '/v3/props?' + urlencode({'sport': 'NBA', 'limit': 1}),
+            data = fetch(BETTINGPROS + '/props?' + urlencode({'sport': 'NBA', 'limit': 1}),
                          {'x-api-key': key})
             snapshot['bettingpros'] = {'status': 'connected', 'test_sport': 'NBA',
                                       'returned_props': len(data.get('props', [])),
