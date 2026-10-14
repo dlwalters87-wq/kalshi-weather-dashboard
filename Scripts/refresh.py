@@ -94,7 +94,9 @@ def exact_match(p, m, sport, mapping):
     if line is None or abs(line - (math.floor(line) + .5)) > .001: return None
     threshold = math.floor(line) + 1
     if not re.search(r'(?<!\d)' + str(threshold) + r'(?!\d)', text): return None
-    if not re.search(r'\b(at least|or more|more than|over)\b', text): return None
+        plus_threshold = re.search(r'(?<![\d.])' + str(threshold) + r'\s*\+', label)
+    word_threshold = re.search(r'\b(at least|or more|more than|over)\b', text)
+    if not (plus_threshold or word_threshold): return None
     if re.search(r'\b(between|exactly|under|fewer|less than)\b', text): return None
     return {'player': name, 'stat': bpstat, 'threshold': threshold, 'line': line}
 
