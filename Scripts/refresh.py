@@ -44,6 +44,8 @@ STAT_ALIASES = {
 
 def stat_type(s):
     s = norm(s)
+        if 'hits' in s and ('runs' in s or 'rbis' in s):
+        return None
     matches = [key for key, aliases in STAT_ALIASES.items()
                if any(re.search(r'\b' + re.escape(a) + r'\b', s) for a in aliases)]
     return matches[0] if len(matches) == 1 else None
