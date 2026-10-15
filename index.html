@@ -1,1 +1,311 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kalshi Opportunity Scanner v3</title><style>*{box-sizing:border-box}body{background:#0b1422;color:#eaf2ff;font:15px system-ui,-apple-system,sans-serif;margin:0}main{max-width:850px;margin:auto;padding:18px}h1{font-size:27px;margin-bottom:6px}h2{font-size:20px}section{background:#19283e;border:1px solid #354b67;border-radius:15px;padding:17px;margin:15px 0}button{background:#3787f7;color:white;border:0;border-radius:9px;padding:12px 16px;font-weight:700}a{color:#a6d2ff}.muted{color:#b8c8da;font-size:13px;line-height:1.5}.card{background:#102038;border:1px solid #3a506d;border-radius:12px;padding:15px;margin:12px 0}.row{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}.edge{color:#80edb7;font-weight:700}.warn{color:#ffdb90}.big{font-size:20px;font-weight:750}.pill{display:inline-block;padding:5px 9px;background:#304963;border-radius:6px}small{color:#bdcce0}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:15px}.stat{background:#102038;border-radius:9px;padding:12px}.stat strong{font-size:23px;display:block;margin-top:5px}#status{font-weight:700}#diagnostic{line-height:1.5;overflow-wrap:anywhere}@media(min-width:600px){.stats{grid-template-columns:repeat(4,minmax(0,1fr))}}</style></head><body><main><h1>Kalshi Opportunity Scanner</h1><p class="muted">Ranked research candidates from matched BettingPros projections and Kalshi market prices. No automatic trades.</p><section><div class="row"><div id="status">Loading latest scan…</div><button onclick="location.reload()">Refresh page</button></div><p class="muted" id="time"></p><div class="stats"><div class="stat">Kalshi markets<strong id="km">—</strong></div><div class="stat">BettingPros props<strong id="bp">—</strong></div><div class="stat">Usable projections<strong id="usable">—</strong></div><div class="stat">Exact matches<strong id="matched">—</strong></div></div></section><section><h2>Top opportunities</h2><p class="muted">Only equivalent player, statistic, and threshold outcomes qualify. A candidate still requires a check of Kalshi's contract rules, current prices, and fees.</p><div id="cards">Loading…</div></section><section><h2>Scanner diagnostics</h2><div class="card" id="diagnostic">Loading…</div><div id="coverage" class="muted"></div><p class="muted">The scan covers up to 15,000 open Kalshi markets and up to 100 BettingPros props per queried sport, subject to API limits. These are sampled markets, not the full exchanges. Refresh page reloads the last GitHub Actions snapshot; it does not start a new API scan.</p><a href="https://github.com/dlwalters87-wq/kalshi-weather-dashboard/actions/workflows/refresh.yml">Run a new scan in GitHub Actions ↗</a></section><p class="muted">Important: Positive estimated edge is not guaranteed profit. The 3¢ deduction is an illustrative fee/slippage buffer, not an exact Kalshi fee. Confirm settlement terms, event dates, liquidity, and current bid/ask before placing a trade. This public website may expose derived research signals; review BettingPros license terms before publishing them.</p></main><script>const el=id=>document.getElementById(id),e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),fmt=x=>Number(x).toFixed(1);fetch('data/latest.json?t='+Date.now()).then(r=>{if(!r.ok)throw Error('Snapshot missing');return r.json()}).then(d=>{let s=d.scanner||{},b=d.bettingpros||{},k=d.kalshi||{};el('status').textContent='Kalshi: '+(k.status||'unknown')+' · BettingPros: '+(b.status||'unknown');el('time').textContent='Last API scan: '+new Date(d.updated_utc).toLocaleString();el('km').textContent=(k.market_count||0).toLocaleString();el('bp').textContent=(s.scanned_props||0).toLocaleString();el('usable').textContent=(s.usable_projections??'—').toLocaleString?.()??s.usable_projections;el('matched').textContent=(s.matches_checked??'—').toLocaleString?.()??s.matches_checked;let a=s.review||[];el('cards').innerHTML=a.length?a.map((x,i)=>`<div class="card"><div class="row"><span class="pill">#${i+1} · REVIEW ${e(x.side)}</span><span class="edge">Est. edge +${fmt(100*x.edge_after_buffer)} pts*</span></div><h3>${e(x.title)}</h3><div class="big">${e(x.side)} at ${fmt(100*x.ask)}¢</div><p>Model probability: ${fmt(100*x.model_probability)}% · Closes: ${e(new Date(x.close_time).toLocaleString())}</p><small>${e(x.ticker)} · ${e(x.match?.player)} · ${e(x.match?.stat)} ${e(x.match?.threshold)}+</small><p class="warn">Research candidate only. Verify exact YES definition, settlement rules, executable price, and actual fees.</p></div>`).join(''):'<div class="card"><div class="big warn">NO QUALIFIED TRADES FOUND</div><p>No candidate passed this scan. This does not prove there are no opportunities elsewhere.</p></div>';el('diagnostic').textContent=s.diagnostic||'Older snapshot or no diagnostic information available. Run the updated GitHub Actions workflow.';el('coverage').textContent='BettingPros successful sport queries: '+(b.successful_queries??0)+' · Market labels loaded: '+(b.market_labels??'—')+' · Potential candidates: '+a.length+(k.more_pages?' · Kalshi market coverage incomplete':'')+(b.errors?.length?' · API warnings: '+b.errors.join('; '):'')}).catch(err=>{el('status').textContent='Could not load scan';el('cards').textContent=err.message;el('diagnostic').textContent='Check that GitHub Actions has completed successfully.'})</script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b1422">
+<title>Weekly Kalshi Board</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1422;color:#eef4ff;font:16px system-ui,-apple-system,sans-serif}
+main{max-width:1050px;margin:auto;padding:20px}
+h1{font-size:29px;margin-bottom:5px}h2{font-size:21px}h3{margin:10px 0}
+p{line-height:1.5}
+section,.game{border:1px solid #334a66;border-radius:16px;padding:18px;margin:16px 0;background:#17263b}
+.muted,small{color:#bac9dc}.muted{font-size:14px}
+.row{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+button,select,input{font:inherit;border-radius:9px;padding:12px;border:1px solid #506886;background:#102037;color:#fff}
+button{cursor:pointer;background:#2767bb}
+input{flex:1;min-width:160px}
+a{color:#9dcdff}
+.pill{background:#2d435e;padding:5px 9px;border-radius:7px;font-size:13px}
+.warn{color:#ffdc97}.good{color:#88e9b7}
+.market{border-top:1px solid #334a66;padding:14px 0;overflow-wrap:anywhere}
+.prices{display:flex;gap:16px;flex-wrap:wrap;margin:9px 0;font-weight:700}
+.candidate{border-left:3px solid #88e9b7;padding:8px 14px;margin:16px 0;background:#102037;border-radius:7px}
+.notice{padding:12px;background:#302b20;border-radius:9px;color:#ffdc97}
+summary{cursor:pointer;padding:10px 0;font-weight:600}
+details small{font-size:11px}
+#diagnostic{white-space:pre-wrap;overflow-wrap:anywhere}
+.empty{padding:20px;color:#bac9dc}
+@media(max-width:500px){
+main{padding:12px}
+section,.game{padding:14px}
+h1{font-size:25px}
+.controls select{flex:1}
+}
+</style>
+</head>
+<body>
+<main>
+<h1>Weekly Kalshi Board</h1>
+<p class="muted">Monday–Sunday · Eastern time · Upcoming games, available prices and research comparisons.</p>
+
+<section>
+<div class="row">
+<strong id="week">Loading week…</strong>
+<button id="reload">Reload snapshot</button>
+</div>
+<p id="updated" class="muted"></p>
+<p id="status"></p>
+<div id="notice"></div>
+<p class="muted">Reloading this page shows the last saved scan. It does not fetch new prices from Kalshi.</p>
+<a href="https://github.com/dlwalters87-wq/kalshi-weather-dashboard/actions/workflows/refresh.yml" target="_blank" rel="noopener">Run a new scan in GitHub Actions ↗</a>
+</section>
+
+<section>
+<h2>Research candidates</h2>
+<p class="muted">Candidates must pass the model and price checks. A blank list does not hide games from the weekly board below.</p>
+<div id="candidates">Loading…</div>
+</section>
+
+<section>
+<h2>This week’s upcoming games</h2>
+<div class="controls">
+<select id="sport" aria-label="Sport">
+<option value="">All sports</option>
+<option>NFL</option>
+<option>NCAAF</option>
+<option>NBA</option>
+<option>MLB</option>
+<option>NHL</option>
+</select>
+<select id="day" aria-label="Game date">
+<option value="">All days</option>
+</select>
+<input id="search" placeholder="Search teams or players" aria-label="Search teams or players">
+</div>
+<p id="count" class="muted"></p>
+<p class="muted">Game-winner, spread and total prices are listed alongside available player props. BettingPros game-odds comparisons currently cover college football; player comparisons cover NFL, NBA, MLB and NHL. Missing comparisons are labeled.</p>
+<div id="games">Loading…</div>
+</section>
+
+<section>
+<details>
+<summary>Scan coverage and diagnostics</summary>
+<p id="coverage" class="muted"></p>
+<p id="diagnostic" class="muted"></p>
+</details>
+</section>
+
+<p class="muted">Prices are saved snapshots, not live quotes. Model probabilities are estimates. The 3¢ buffer is an estimate, not an exact fee. Verify contract settlement rules, current prices, fees and liquidity before trading. No automatic trades.</p>
+</main>
+
+<script>
+const el=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;',
+  '"':'&quot;',"'":'&#39;'
+}[c]));
+
+const etDate=d=>new Intl.DateTimeFormat('en-CA',{
+  timeZone:'America/New_York',
+  year:'numeric',month:'2-digit',day:'2-digit'
+}).format(d);
+
+const dayText=s=>new Date(s+'T12:00:00Z').toLocaleDateString('en-US',{
+  timeZone:'America/New_York',
+  weekday:'short',month:'short',day:'numeric'
+});
+
+const timeText=s=>new Date(s).toLocaleString('en-US',{
+  timeZone:'America/New_York',
+  month:'short',day:'numeric',hour:'numeric',minute:'2-digit'
+})+' ET';
+
+const cents=x=>typeof x==='number'&&x>0&&x<1
+  ?(100*x).toFixed(1)+'¢':'Unavailable';
+
+const pct=x=>(100*x).toFixed(1)+'%';
+let data=null;
+
+function currentWeekStart(){
+  const t=etDate(new Date());
+  const d=new Date(t+'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate()-(d.getUTCDay()+6)%7);
+  return d.toISOString().slice(0,10);
+}
+
+function upcoming(g){
+  return g.start
+    ?new Date(g.start)>new Date()
+    :g.date>etDate(new Date());
+}
+
+function quote(m){
+  const c=m.comparison;
+  return `
+    <div class="market">
+      <strong>${esc(m.title)}</strong>
+      <div class="prices">
+        <span>YES ${cents(m.yes)}</span>
+        <span>NO ${cents(m.no)}</span>
+      </div>
+      <div class="muted">${
+        c
+          ?'Estimated YES probability: '+pct(c.yes_probability)
+            +' · '+esc(c.source)
+          :'Comparison unavailable — no verified model match in this scan.'
+      }</div>
+      <small>${esc(m.ticker)}</small>
+    </div>`;
+}
+
+function render(){
+  if(!data)return;
+
+  const oldWeek=data.week?.start!==currentWeekStart();
+  const games=oldWeek?[]:(data.board?.games||[]).filter(upcoming);
+  const sport=el('sport').value;
+  const day=el('day').value;
+  const query=el('search').value.toLowerCase().trim();
+
+  const shown=games.filter(g=>
+    (!sport||g.sport===sport)&&
+    (!day||g.date===day)&&
+    (!query||(
+      g.title+' '+g.markets.map(m=>m.title).join(' ')
+    ).toLowerCase().includes(query))
+  );
+
+  el('count').textContent=
+    shown.length+' games shown · '+
+    games.length+' upcoming games in this snapshot';
+
+  el('games').innerHTML=shown.length
+    ?shown.map(g=>`
+      <article class="game">
+        <div class="row">
+          <span class="pill">${esc(g.sport)}</span>
+          <span class="muted">${esc(dayText(g.date))}</span>
+        </div>
+        <h3>${esc(g.title)}</h3>
+        <p class="muted">${
+          g.start
+            ?esc(timeText(g.start))+
+              (g.schedule_status==='contract_time'
+                ?' · Contract-listed start':'')
+            :'Start time unverified — game date is from the contract rules.'
+        }</p>
+        <details>
+          <summary>View ${g.markets.length} available contracts and prices</summary>
+          ${g.markets.map(quote).join('')}
+        </details>
+      </article>
+    `).join('')
+    :`<p class="empty">${
+      oldWeek
+        ?'This snapshot is from a previous week. Run a new scan.'
+        :'No upcoming games match these filters in the saved scan. Coverage may be incomplete.'
+    }</p>`;
+
+  const candidates=oldWeek?[]:(data.scanner?.review||[]).filter(
+    x=>x.scheduled_start&&new Date(x.scheduled_start)>new Date()
+  );
+
+  el('candidates').innerHTML=candidates.length
+    ?candidates.map(x=>`
+      <div class="candidate">
+        <span class="pill">
+          ${esc(x.sport||'')} · REVIEW ${esc(x.side)}
+        </span>
+        <h3>${esc(x.title)}</h3>
+        <p>
+          ${esc(x.side)} at ${cents(x.ask)}
+          · Estimated probability ${pct(x.model_probability)}
+        </p>
+        <p class="good">
+          Estimated edge after buffer:
+          ${(100*x.edge_after_buffer).toFixed(1)} percentage points
+        </p>
+        <p class="muted">
+          ${esc(timeText(x.scheduled_start))} · ${esc(x.warning)}
+        </p>
+      </div>
+    `).join('')
+    :'<p class="muted">No upcoming candidate passed the checks in this snapshot. You can still browse matchup prices below.</p>';
+}
+
+el('reload').onclick=()=>location.reload();
+
+for(const id of ['sport','day','search']){
+  el(id).addEventListener('input',render);
+}
+
+fetch('data/latest.json?t='+Date.now(),{cache:'no-store'})
+.then(r=>{
+  if(!r.ok)throw Error('Snapshot unavailable');
+  return r.json();
+})
+.then(d=>{
+  data=d;
+
+  el('week').textContent=d.week
+    ?dayText(d.week.start)+' – '+dayText(d.week.end)+' · ET'
+    :'Weekly update not loaded yet';
+
+  el('updated').textContent='Last API scan: '+timeText(d.updated_utc);
+
+  el('status').textContent=
+    'Kalshi: '+(d.kalshi?.status||'unknown')+
+    ' · BettingPros: '+(d.bettingpros?.status||'unknown');
+
+  const warnings=[];
+  if(!d.board){
+    warnings.push('Run the version 10 refresh script to create the weekly board.');
+  }
+  if(d.week&&d.week.start!==currentWeekStart()){
+    warnings.push('The saved scan is from a previous week. Run a new scan.');
+  }
+  if(Date.now()-new Date(d.updated_utc).getTime()>3600000){
+    warnings.push('This snapshot is more than an hour old. Prices may have changed.');
+  }
+  if(d.bettingpros?.status!=='connected'||d.kalshi?.status!=='ok'){
+    warnings.push('Data coverage is incomplete. Missing comparisons do not mean there is no opportunity.');
+  }
+  if(d.board?.hidden_today_unverified){
+    warnings.push(
+      d.board.hidden_today_unverified+
+      ' games dated today are hidden because their start times could not be verified.'
+    );
+  }
+
+  el('notice').innerHTML=warnings.map(
+    x=>`<p class="notice">${esc(x)}</p>`
+  ).join('');
+
+  const dates=[...new Set(
+    (d.board?.games||[]).filter(upcoming).map(g=>g.date)
+  )].sort();
+
+  el('day').innerHTML=
+    '<option value="">All days</option>'+
+    dates.map(s=>
+      `<option value="${esc(s)}">${esc(dayText(s))}</option>`
+    ).join('');
+
+  el('coverage').textContent=
+    (d.kalshi?.market_count||0)+' weekly contracts fetched · '+
+    (d.scanner?.scanned_props||0)+' player props scanned · '+
+    (d.scanner?.debug?.requests_used||0)+
+    ' BettingPros calls used. Coverage depends on available markets and API limits.';
+
+  el('diagnostic').textContent=
+    (d.scanner?.diagnostic||'')+
+    '\nCollege football: '+
+    JSON.stringify(d.scanner?.debug?.college_football||{});
+
+  render();
+  setInterval(render,60000);
+})
+.catch(err=>{
+  el('status').textContent='Could not load snapshot';
+  el('games').textContent=err.message;
+  el('candidates').textContent=
+    'Run the refresh workflow and reload this page.';
+});
+</script>
+</body>
+</html>
