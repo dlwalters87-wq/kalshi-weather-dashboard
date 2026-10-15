@@ -17,7 +17,6 @@ KALSHI = 'https://external-api.kalshi.com/trade-api/v2'
 BP = 'https://api.bettingpros.com/v3'
 UTC = dt.timezone.utc
 EASTERN = ZoneInfo('America/New_York')
-
 BP_REQUEST_BUDGET = 40
 BP_DELAY_SECONDS = 1.5
 BUFFER = 0.03
@@ -40,7 +39,7 @@ SERIES = {
     'KXNHLSAVES': ('NHL', 'saves'),
     'KXNHLSAVE': ('NHL', 'saves'),
     'KXNHLGOAL': ('NHL', 'goals'),
-    'KXNHLANYGOAL': ('NHL', 'goals'),
+    'KXNHLANYGOAL': ('NHL', 'goals')
 }
 
 ALIASES = {
@@ -58,31 +57,46 @@ ALIASES = {
     'rush yards': 'rushing yards',
     'rush yds': 'rushing yards',
     'three pointers': 'three pointers',
-    '3pt': 'three pointers',
-    'threes': 'three pointers',
-    'hits': 'hits',
-    'total bases': 'total bases',
+    '3pt': 'three pointers', 'threes': 'three pointers',
+    'hits': 'hits', 'total bases': 'total bases',
     'stolen bases': 'stolen bases',
     'strikeouts': 'strikeouts',
-    'saves': 'saves',
-    'goals': 'goals',
+    'saves': 'saves', 'goals': 'goals'
 }
 
 CODES = {
     'MLB': {
-        'h': 'hits', 'tb': 'total bases',
-        'sb': 'stolen bases', 'k': 'strikeouts',
-        'ks': 'strikeouts', 'hr': 'home runs',
-        'hrs': 'home runs'
+        'h': 'hits', 'tb': 'total bases', 'sb': 'stolen bases',
+        'k': 'strikeouts', 'ks': 'strikeouts',
+        'hr': 'home runs', 'hrs': 'home runs'
     },
-    'NHL': {'sv': 'saves', 'sog': 'shots on goal'},
+    'NHL': {'sv': 'saves', 'sog': 'shots on goal'}
 }
+
+COLLEGE_SERIES = {
+    'KXNCAAFGAME': ('NCAAF', 'moneyline'),
+    'KXNCAAFSPREAD': ('NCAAF', 'spread'),
+    'KXNCAAFTOTAL': ('NCAAF', 'total')
+}
+
+GAME_SERIES = {
+    prefix + suffix: (sport, kind)
+    for prefix, sport in [
+        ('KXNFL', 'NFL'), ('KXNBA', 'NBA'),
+        ('KXMLB', 'MLB'), ('KXNHL', 'NHL')
+    ]
+    for suffix, kind in [
+        ('GAME', 'moneyline'), ('SPREAD', 'spread'), ('TOTAL', 'total')
+    ]
+}
+
+KALSHI_BLOCKED = False
 
 
 def norm(value):
     value = unicodedata.normalize('NFKD', str(value or ''))
     value = ''.join(c for c in value if not unicodedata.combining(c))
-    return re.sub(r'[^a-z0-9]+', ' ', value.lower()).strip()
+    return re.sub('[^a-z0-9]+', ' ', value.lower()).strip()
 
 
 def number(value):
@@ -109,16 +123,33 @@ def rows(data, key):
 
 
 def fetch(url, headers=None):
+    global KALSHI_BLOCKED
+    if url.startswith(KALSHI):
+        if KALSHI_BLOCKED:
+            raise RuntimeError('Kalshi scan paused after rate limit')
+        time.sleep(0.35)
+
     request = Request(url, headers={
-        'User-Agent': 'KalshiResearchDashboard/9.0',
+        'User-Agent': 'KalshiResearchDashboard/10.0',
         **(headers or {})
     })
-    with urlopen(request, timeout=35) as response:
-        return json.load(response)
+
+    for attempt in range(2):
+        try:
+            with urlopen(request, timeout=35) as response:
+                return json.load(response)
+        except HTTPError as ex:
+            if not url.startswith(KALSHI) or ex.code != 429:
+                raise
+            delay = number(ex.headers.get('Retry-After')) or 5
+            if attempt or delay > 30:
+                KALSHI_BLOCKED = True
+                raise
+            time.sleep(max(5, delay))
 
 
 def error_label(ex):
-    # Never publish raw errors, credentials, or response bodies.
+    # Never publish raw response bodies, credentials or request headers.
     if isinstance(ex, HTTPError):
         if ex.code == 429:
             try:
@@ -138,11 +169,21 @@ def timestamp(value, naive_utc=False):
         if value.tzinfo is None:
             if not naive_utc:
                 return None
-            # BettingPros scheduled examples use offset-free UTC.
             value = value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
     except (ValueError, TypeError):
         return None
+
+
+def week_bounds(now):
+    day = now.astimezone(EASTERN).date()
+    monday = day - dt.timedelta(days=day.weekday())
+    return monday, monday + dt.timedelta(days=6)
+
+
+def in_week(day, now):
+    monday, sunday = week_bounds(now)
+    return day is not None and monday <= day <= sunday
 
 
 def game_date(market):
@@ -174,7 +215,9 @@ def market_label(definition, sport):
         value = definition.get(key)
         if isinstance(value, str) and value.strip():
             value = norm(value)
-            return CODES.get(sport, {}).get(value, ALIASES.get(value, value))
+            return CODES.get(sport, {}).get(
+                value, ALIASES.get(value, value)
+            )
     return ''
 
 
@@ -193,8 +236,8 @@ def next_page(current, pagination):
         raise ValueError('Unexpected next-page destination')
 
     allowed = {
-        'sport', 'limit', 'page', 'date', 'start', 'end',
-        'market_id', 'event_id', 'include_events', 'include_markets'
+        'sport', 'season', 'week', 'limit', 'page', 'date', 'start',
+        'end', 'market_id', 'event_id', 'include_events', 'include_markets'
     }
     params = {k: v for k, v in parse_qsl(target.query) if k in allowed}
     params.update({'include_events': 'true', 'include_markets': 'true'})
@@ -210,10 +253,13 @@ def team_code(event, team_id):
                 if abbreviation:
                     return str(abbreviation).upper()
     text = str(team_id or '').upper()
-    return text if re.fullmatch(r'[A-Z]{2,4}', text) else None
+    return text if re.fullmatch('[A-Z]{2,4}', text) else None
 
 
 def verify_event(event, market, sport, today, now):
+    today = game_date(market)
+    if not today or not in_week(today, now):
+        return 'outside_current_week'
     if not event or str(event.get('sport', '')).upper() != sport:
         return 'event_missing_or_wrong_sport'
     if event.get('status') not in ('scheduled', 'not_started', 'created'):
@@ -221,7 +267,7 @@ def verify_event(event, market, sport, today, now):
 
     start = timestamp(event.get('scheduled'), naive_utc=True)
     if start is None or start.astimezone(EASTERN).date() != today:
-        return 'event_date_unverified_or_not_today'
+        return 'event_date_unverified_or_mismatch'
     if start <= now:
         return 'event_already_started'
     if game_date(market) != today:
@@ -233,7 +279,9 @@ def verify_event(event, market, sport, today, now):
         return 'event_team_codes_missing'
 
     suffix = str(market.get('event_ticker') or '').split('-', 1)[-1]
-    parsed = re.fullmatch(r'(\d{2}[A-Z]{3}\d{2})(\d{4})?([A-Z]+)', suffix)
+    parsed = re.fullmatch(
+        r'(\d{2}[A-Z]{3}\d{2})(\d{4})?([A-Z]+)', suffix
+    )
     if not parsed:
         return 'contract_event_format_unverified'
     if parsed[1] != today.strftime('%y%b%d').upper():
@@ -246,7 +294,6 @@ def verify_event(event, market, sport, today, now):
             return 'event_start_time_mismatch'
     elif sport == 'MLB':
         return 'baseball_game_number_unverified'
-
     return None
 
 
@@ -262,55 +309,58 @@ def threshold_matches(market, line):
     return False
 
 
-COLLEGE_SERIES = {
-    'KXNCAAFGAME': ('NCAAF', 'moneyline'),
-    'KXNCAAFSPREAD': ('NCAAF', 'spread'),
-    'KXNCAAFTOTAL': ('NCAAF', 'total'),
-}
-
-
 def team_names(event, ident):
     names = set()
     for p in rows(event, 'participants'):
         if str(p.get('id')) != str(ident):
             continue
         team = p.get('team') or {}
-        for value in (p.get('name'), team.get('city'), team.get('slug'),
-                      str(team.get('city') or '') + ' ' + str(p.get('name') or '')):
+        for value in (
+            p.get('name'), team.get('city'), team.get('slug'),
+            str(team.get('city') or '') + ' ' + str(p.get('name') or '')
+        ):
             if value:
                 names.add(norm(value).replace(' st ', ' state '))
     return names
 
 
 def college_team_name(value):
-    value = norm(value)
-    return re.sub(r'\bst\b', 'state', value)
+    return re.sub(r'\bst\b', 'state', norm(value))
 
 
 def college_event_check(event, market, today, now):
+    today = game_date(market)
+    if not today or not in_week(today, now):
+        return 'outside_current_week'
     if event.get('sport') != 'NCAAF':
         return 'wrong_sport'
+
     start = timestamp(event.get('scheduled'), naive_utc=True)
-    if (event.get('status') not in ('scheduled', 'not_started', 'created')
-            or start is None or start <= now):
+    if (
+        event.get('status') not in ('scheduled', 'not_started', 'created')
+        or start is None or start <= now
+    ):
         return 'not_verified_pregame'
     if start.astimezone(EASTERN).date() != today or game_date(market) != today:
         return 'date_mismatch'
 
-    # College abbreviations differ across providers; use exact team names in rules.
     pair = re.search(
         r'(?:in the|wins the) (.+?) vs\.? (.+?) college football game originally',
         str(market.get('rules_primary') or ''), re.I
     )
     if not pair:
         return 'rules_team_pair_unparsed'
+
     a, b = map(college_team_name, pair.groups())
     home = {college_team_name(n) for n in team_names(event, event.get('home'))}
-    away = {college_team_name(n) for n in team_names(event, event.get('visitor'))}
+    away = {
+        college_team_name(n) for n in team_names(event, event.get('visitor'))
+    }
     if not ((a in home and b in away) or (a in away and b in home)):
         return 'team_names_mismatch'
     if a == b or (a in home and a in away) or (b in home and b in away):
         return 'ambiguous_team_names'
+
     close = timestamp(market.get('close_time'))
     return None if close and close > now else 'closed_or_missing_deadline'
 
@@ -322,15 +372,18 @@ def college_selection_yes(kind, selection, event, market, line):
             norm(selection.get('selection')) == 'over'
             and threshold_matches(market, line)
         )
+
     ident = selection.get('participant')
     if ident is None or str(ident) not in (
         str(event.get('home')), str(event.get('visitor'))
     ):
         return False
+
     names = {college_team_name(n) for n in team_names(event, ident)}
     if kind == 'moneyline':
         match = re.match(r'If (.+?) wins the ', rules)
         return bool(match and college_team_name(match[1]) in names)
+
     match = re.match(
         r'If (.+?) wins by more than ([0-9.]+) points in the ', rules
     )
@@ -345,18 +398,19 @@ def scan_college(markets, key, today, now):
     info = {
         'mode': 'full_game_matchups', 'pages': 0, 'props': 0,
         'events': 0, 'offers': 0, 'matches': 0, 'candidates': 0,
-        'requests': 0, 'more_pages': False, 'rejections': {},
-        'status': 'not_started'
+        'requests': 0, 'more_pages': False,
+        'rejections': {}, 'status': 'not_started'
     }
     reviews, rejects = [], Counter()
-    relevant = [(stat, m) for sport, stat, m in markets if sport == 'NCAAF']
+    relevant = [
+        (stat, m) for sport, stat, m in markets if sport == 'NCAAF'
+    ]
     if not relevant or not key:
         info['status'] = (
-            'no_same_day_contracts' if not relevant else 'missing_api_key'
+            'no_current_week_contracts' if not relevant else 'missing_api_key'
         )
         return reviews, info, None
 
-    # Reserve most of the shared 40-request budget for existing player scans.
     def pages(endpoint, params, array):
         page = 1
         seen = set()
@@ -367,6 +421,7 @@ def scan_college(markets, key, today, now):
             if info['requests']:
                 time.sleep(BP_DELAY_SECONDS)
             info['requests'] += 1
+
             data = fetch(
                 BP + '/' + endpoint + '?' + urlencode({
                     **params, 'limit': 50, 'page': page
@@ -382,6 +437,7 @@ def scan_college(markets, key, today, now):
                 raise ValueError('Repeated page')
             seen.add(digest)
             yield batch
+
             pagination = data.get('_pagination') or {}
             if not pagination.get('next'):
                 break
@@ -418,14 +474,19 @@ def scan_college(markets, key, today, now):
             'events',
             {
                 'sport': 'NCAAF',
-                'start': today.isoformat(),
-                'end': (today + dt.timedelta(days=1)).isoformat()
+                'start': week_bounds(now)[0].isoformat(),
+                'end': (
+                    week_bounds(now)[1] + dt.timedelta(days=1)
+                ).isoformat()
             },
             'events'
         ):
             events.extend(batch)
 
         info['events'] = len(events)
+        info['_event_records'] = events
+        events.sort(key=lambda e: str(e.get('scheduled') or ''))
+
         for event in events:
             candidates = []
             for kind, market in relevant:
@@ -435,14 +496,12 @@ def scan_college(markets, key, today, now):
                 else:
                     candidates.append((kind, market))
             if not candidates:
-                rejects['no_verified_same_day_game'] += 1
+                rejects['no_verified_weekly_game'] += 1
                 continue
 
             params = {
-                'sport': 'NCAAF',
-                'event_id': event['id'],
-                'market_id': ':'.join(definitions),
-                'live': 'false'
+                'sport': 'NCAAF', 'event_id': event['id'],
+                'market_id': ':'.join(definitions), 'live': 'false'
             }
             for batch in pages('offers', params, 'offers'):
                 info['offers'] += len(batch)
@@ -460,8 +519,6 @@ def scan_college(markets, key, today, now):
                         if selection.get('active') is not True:
                             continue
 
-                        # Use the consensus row rather than choosing the
-                        # most optimistic model estimate across books.
                         for book in rows(selection, 'books'):
                             if str(book.get('id')) != '0':
                                 continue
@@ -498,8 +555,8 @@ def scan_college(markets, key, today, now):
                                 if kind != 'moneyline' and (
                                     line is None
                                     or abs(
-                                        line - math.floor(line) - .5
-                                    ) > .001
+                                        line - math.floor(line) - 0.5
+                                    ) > 0.001
                                 ):
                                     rejects['non_half_point_line'] += 1
                                     continue
@@ -515,6 +572,14 @@ def scan_college(markets, key, today, now):
                                         continue
 
                                     info['matches'] += 1
+                                    market['_comparison'] = {
+                                        'yes_probability': probability,
+                                        'source': (
+                                            'BettingPros consensus '
+                                            'cover probability'
+                                        )
+                                    }
+
                                     for side, field, prob in [
                                         (
                                             'YES', 'yes_ask_dollars',
@@ -528,7 +593,6 @@ def scan_college(markets, key, today, now):
                                         ask = number(market.get(field))
                                         if ask is None or not 0 < ask < 1:
                                             continue
-
                                         edge = prob - ask - BUFFER
                                         if edge <= MIN_EDGE:
                                             rejects[
@@ -552,8 +616,13 @@ def scan_college(markets, key, today, now):
                                             ),
                                             'volume': market.get('volume_fp'),
                                             'scheduled_game_date': (
-                                                today.isoformat()
+                                                game_date(market).isoformat()
                                             ),
+                                            'scheduled_start': timestamp(
+                                                event.get('scheduled'),
+                                                naive_utc=True
+                                            ).isoformat(),
+                                            'sport': 'NCAAF',
                                             'match': {
                                                 'sport': 'NCAAF',
                                                 'stat': kind,
@@ -589,13 +658,10 @@ def scan_college(markets, key, today, now):
             else error_label(ex)
         )
         info.update({
-            'status': 'partial',
-            'error': label,
-            'more_pages': True
+            'status': 'partial', 'error': label, 'more_pages': True
         })
         if label in (
-            'daily_quota_exhausted', 'rate_limited',
-            'HTTP_401', 'HTTP_403'
+            'daily_quota_exhausted', 'rate_limited', 'HTTP_401', 'HTTP_403'
         ):
             stop = label
 
@@ -604,35 +670,174 @@ def scan_college(markets, key, today, now):
     return reviews, info, stop
 
 
+def board_title(market):
+    rules = str(market.get('rules_primary') or '')
+    found = re.search(
+        r'(?:in the|wins the) (.+?) game originally scheduled',
+        rules, re.I
+    )
+    if found:
+        return re.sub(
+            r'\s+(?:college football|pro football|professional baseball|'
+            r'pro baseball|NBA|NHL|basketball|hockey)$',
+            '', found[1], flags=re.I
+        )
+    return str(market.get('event_ticker') or 'Game')
+
+
+def build_board(markets, events, now):
+    groups = {}
+    today = now.astimezone(EASTERN).date()
+
+    for sport, stat, market in markets:
+        day = game_date(market)
+        if not in_week(day, now) or day < today:
+            continue
+        suffix = str(market.get('event_ticker') or '').split('-', 1)[-1]
+        key = sport + ':' + suffix
+        group = groups.setdefault(key, {
+            'id': key,
+            'sport': sport,
+            'date': day.isoformat(),
+            'title': board_title(market),
+            'start': None,
+            'schedule_status': 'time_unverified',
+            'markets': [],
+            '_sample': market
+        })
+
+        close = timestamp(market.get('close_time'))
+        if not close or close <= now:
+            continue
+
+        group['markets'].append({
+            'ticker': market['ticker'],
+            'title': market.get('title'),
+            'stat': stat,
+            'yes': number(market.get('yes_ask_dollars')),
+            'no': number(market.get('no_ask_dollars')),
+            'comparison': market.get('_comparison')
+        })
+
+    result, hidden = [], 0
+    event_list = list(events.items())
+
+    for group in groups.values():
+        market = group.pop('_sample')
+        sport = group['sport']
+        day = game_date(market)
+        matched = []
+
+        for (event_sport, _), event in event_list:
+            if event_sport != sport:
+                continue
+            start = timestamp(event.get('scheduled'), naive_utc=True)
+            if not start or start.astimezone(EASTERN).date() != day:
+                continue
+
+            probe = dict(event, status='scheduled')
+            before_start = start - dt.timedelta(seconds=1)
+            check = (
+                college_event_check(
+                    probe, market, day, before_start
+                )
+                if sport == 'NCAAF'
+                else verify_event(
+                    probe, market, sport, day, before_start
+                )
+            )
+            if check is None:
+                matched.append((start, event))
+
+        starts = {start for start, _ in matched}
+        if len(starts) == 1:
+            start = next(iter(starts))
+            if start <= now or any(
+                e.get('status') not in ('scheduled', 'created', 'not_started')
+                for _, e in matched
+            ):
+                continue
+            group['start'] = start.isoformat()
+            group['schedule_status'] = 'verified'
+        else:
+            parsed = re.fullmatch(
+                r'(\d{2}[A-Z]{3}\d{2})(\d{4})([A-Z]+)',
+                group['id'].split(':', 1)[1]
+            )
+            if parsed:
+                try:
+                    start = dt.datetime.combine(
+                        day,
+                        dt.time(int(parsed[2][:2]), int(parsed[2][2:])),
+                        EASTERN
+                    ).astimezone(UTC)
+                    if start <= now:
+                        continue
+                    group['start'] = start.isoformat()
+                    group['schedule_status'] = 'contract_time'
+                except ValueError:
+                    pass
+
+            if not group['start'] and day == today:
+                hidden += 1
+                continue
+
+        if group['markets']:
+            group['markets'].sort(key=lambda x: (
+                x['stat'] not in ('moneyline', 'spread', 'total'),
+                x['stat'], x['title'] or ''
+            ))
+            result.append(group)
+
+    result.sort(key=lambda g: (
+        g['date'], g['start'] or 'Z', g['sport'], g['title']
+    ))
+    return {
+        'games': result,
+        'hidden_today_unverified': hidden,
+        'note': (
+            'Prices are snapshot asks. Future-date games may have '
+            'unverified start times. Game odds comparisons currently '
+            'cover NCAAF; player comparisons cover NFL, NBA, MLB and NHL.'
+        )
+    }
+
+
 def main():
     now = dt.datetime.now(UTC)
     today = now.astimezone(EASTERN).date()
-    debug = {'series': {}, 'sports': {}, 'request_budget': BP_REQUEST_BUDGET}
+    debug = {
+        'series': {}, 'sports': {},
+        'request_budget': BP_REQUEST_BUDGET
+    }
     rejected, unknown = Counter(), Counter()
     markets, errors = [], []
 
     SERIES.update(COLLEGE_SERIES)
+    SERIES.update(GAME_SERIES)
 
     for series, (sport, stat) in SERIES.items():
         cursor, seen = None, set()
-        info = {'items': 0, 'today': 0, 'more_pages': False}
+        info = {'items': 0, 'this_week': 0, 'more_pages': False}
         debug['series'][series] = info
 
         try:
             for _ in range(10):
                 params = {
-                    'series_ticker': series, 'status': 'open',
-                    'limit': 1000, 'mve_filter': 'exclude'
+                    'series_ticker': series,
+                    'status': 'open',
+                    'limit': 1000,
+                    'mve_filter': 'exclude'
                 }
                 if cursor:
                     params['cursor'] = cursor
-                data = fetch(KALSHI + '/markets?' + urlencode(params))
 
+                data = fetch(KALSHI + '/markets?' + urlencode(params))
                 for m in rows(data, 'markets'):
                     info['items'] += 1
-                    if game_date(m) == today:
+                    if in_week(game_date(m), now):
                         markets.append((sport, stat, m))
-                        info['today'] += 1
+                        info['this_week'] += 1
 
                 cursor = data.get('cursor')
                 info['more_pages'] = bool(cursor)
@@ -659,16 +864,24 @@ def main():
     college_review, college_info, college_stop = scan_college(
         markets, key, today, now
     )
+    for event in college_info.pop('_event_records', []):
+        if event.get('id') is not None:
+            events['NCAAF', str(event['id'])] = event
+
     debug['college_football'] = college_info
     if college_info.get('error'):
         errors.append('NCAAF: ' + college_info['error'])
 
     for sport in active_sports:
         pending[sport] = BP + '/props?' + urlencode({
-            'sport': sport, 'limit': 50,
-            'start': today.isoformat(),
-            'end': (today + dt.timedelta(days=1)).isoformat(),
-            'include_events': 'true', 'include_markets': 'true'
+            'sport': sport,
+            'limit': 50,
+            'start': week_bounds(now)[0].isoformat(),
+            'end': (
+                week_bounds(now)[1] + dt.timedelta(days=1)
+            ).isoformat(),
+            'include_events': 'true',
+            'include_markets': 'true'
         })
         debug['sports'][sport] = {
             'pages': 0, 'props': 0, 'more_pages': True
@@ -681,6 +894,7 @@ def main():
         for sport in list(pending):
             if calls >= BP_REQUEST_BUDGET:
                 break
+
             url = pending[sport]
             info = debug['sports'][sport]
 
@@ -688,7 +902,6 @@ def main():
                 if url in seen_urls:
                     raise ValueError('Repeated pagination URL')
                 seen_urls.add(url)
-
                 if calls:
                     time.sleep(BP_DELAY_SECONDS)
                 calls += 1
@@ -709,16 +922,14 @@ def main():
 
                 for definition in rows(data, 'markets'):
                     if definition.get('id') is not None:
-                        definitions[(sport, str(definition['id']))] = definition
+                        definitions[sport, str(definition['id'])] = definition
                 for event in rows(data, 'events'):
                     if event.get('id') is not None:
-                        events[(sport, str(event['id']))] = event
+                        events[sport, str(event['id'])] = event
 
                 info['response_fields'] = sorted(data.keys())
-                pagination = data.get('_pagination') or {}
-                nxt = next_page(url, pagination)
+                nxt = next_page(url, data.get('_pagination') or {})
                 info['more_pages'] = bool(nxt)
-
                 if nxt:
                     pending[sport] = nxt
                 else:
@@ -726,6 +937,20 @@ def main():
 
             except Exception as ex:
                 label = error_label(ex)
+
+                if (
+                    label == 'HTTP_400'
+                    and info['pages'] == 0
+                    and not info.get('retried_default_window')
+                ):
+                    info['retried_default_window'] = True
+                    pending[sport] = BP + '/props?' + urlencode({
+                        'sport': sport, 'limit': 50,
+                        'include_events': 'true',
+                        'include_markets': 'true'
+                    })
+                    continue
+
                 info['error'] = label
                 errors.append(sport + ': ' + label)
                 del pending[sport]
@@ -741,18 +966,21 @@ def main():
         stop_reason = 'per_run_request_budget_reached'
 
     debug.update({
-        'requests_used': calls, 'stop_reason': stop_reason,
+        'requests_used': calls,
+        'stop_reason': stop_reason,
         'event_records': len(events),
         'market_definitions': len(definitions)
     })
 
     scanner = {
-        'status': 'insufficient_data', 'scanned_props': len(props),
-        'usable_projections': 0, 'stats_identified': 0,
-        'matches_checked': college_info['matches'], 'review': []
+        'status': 'insufficient_data',
+        'scanned_props': len(props),
+        'usable_projections': 0,
+        'stats_identified': 0,
+        'matches_checked': college_info['matches'],
+        'review': []
     }
     review, event_examples = list(college_review), []
-
     supported = set(SERIES.values()) | {
         ('NCAAF', stat)
         for stat in (
@@ -779,12 +1007,11 @@ def main():
         scanner['usable_projections'] += 1
         definition = definitions.get((sport, str(p.get('market_id'))), {})
 
-        # is_live_activity does NOT establish that a game has started.
-        # Check the explicit period here and event status/start below.
         if definition.get('period') != 'game':
             reason = (
                 'period_missing'
-                if not definition.get('period') else 'period_not_full_game'
+                if not definition.get('period')
+                else 'period_not_full_game'
             )
             rejected[reason] += 1
             continue
@@ -808,7 +1035,8 @@ def main():
         )
 
         if (
-            len(player.split()) < 2 or line is None
+            len(player.split()) < 2
+            or line is None
             or abs(line - math.floor(line) - 0.5) > 0.001
         ):
             rejected['player_or_line_unusable'] += 1
@@ -816,7 +1044,6 @@ def main():
 
         event = events.get((sport, str(p.get('event_id'))), {})
         pattern = re.compile(r'\b' + re.escape(player) + r'\b')
-
         candidates = [
             m for market_sport, market_stat, m in markets
             if market_sport == sport and market_stat == stat
@@ -833,12 +1060,12 @@ def main():
 
             scanner['matches_checked'] += 1
             reason = verify_event(event, m, sport, today, now)
-
             if reason:
                 rejected[reason] += 1
                 if len(event_examples) < 5:
                     event_examples.append({
-                        'ticker': m.get('ticker'), 'reason': reason,
+                        'ticker': m.get('ticker'),
+                        'reason': reason,
                         'event_fields': sorted(event.keys())
                     })
                 continue
@@ -849,6 +1076,10 @@ def main():
                 continue
 
             p_over = probability if side == 'over' else 1 - probability
+            m['_comparison'] = {
+                'yes_probability': p_over,
+                'source': 'BettingPros player projection'
+            }
 
             for direction, field, p_side in (
                 ('YES', 'yes_ask_dollars', p_over),
@@ -873,7 +1104,11 @@ def main():
                     'edge_after_buffer': round(edge, 4),
                     'close_time': m.get('close_time'),
                     'volume': m.get('volume_fp'),
-                    'scheduled_game_date': today.isoformat(),
+                    'scheduled_game_date': game_date(m).isoformat(),
+                    'scheduled_start': timestamp(
+                        event.get('scheduled'), naive_utc=True
+                    ).isoformat(),
+                    'sport': sport,
                     'match': {
                         'player': player, 'stat': stat, 'line': line,
                         'threshold': math.floor(line) + 1,
@@ -892,8 +1127,9 @@ def main():
         unique.setdefault(candidate['ticker'], candidate)
 
     scanner['review'] = list(unique.values())[:20]
-    scanner['status'] = 'review_candidates' if unique else 'no_qualified_matches'
-
+    scanner['status'] = (
+        'review_candidates' if unique else 'no_qualified_matches'
+    )
     debug.update({
         'rejections': dict(rejected),
         'unsupported_stats': dict(unknown.most_common(20)),
@@ -903,20 +1139,20 @@ def main():
         str(d.get('period', '(missing)')) for d in definitions.values()
     ))
     debug['live_activity_flags'] = dict(Counter(
-        str(d.get('is_live_activity', '(missing)')) for d in definitions.values()
+        str(d.get('is_live_activity', '(missing)'))
+        for d in definitions.values()
     ))
     scanner['debug'] = debug
 
     incomplete = (
-        bool(stop_reason) or bool(errors) or college_info['more_pages']
+        bool(stop_reason) or bool(errors)
+        or college_info['more_pages']
         or any(info['more_pages'] for info in debug['sports'].values())
     )
-
     summary = (
         'Research candidates found.'
         if unique else 'No candidate passed the verification checks.'
     )
-
     summary += (
         ' College football game matchups: '
         + college_info['status'] + '.'
@@ -927,7 +1163,6 @@ def main():
             ' BettingPros coverage is incomplete: '
             + str(stop_reason or 'request error') + '.'
         )
-
     if stop_reason == 'daily_quota_exhausted':
         reset = now.replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -949,15 +1184,21 @@ def main():
     )
 
     out = {
-        'version': 9,
+        'version': 10,
         'updated_utc': now.isoformat(),
+        'week': {
+            'start': week_bounds(now)[0].isoformat(),
+            'end': week_bounds(now)[1].isoformat(),
+            'timezone': 'America/New_York'
+        },
+        'board': build_board(markets, events, now),
         'kalshi': {
             'status': 'partial' if kalshi_incomplete else 'ok',
             'market_count': len(markets),
             'more_pages': kalshi_incomplete,
             'scope': (
-                'Same-day player props and college football '
-                'full-game winner, spread and total'
+                'Current Monday-Sunday week: player props, game markets '
+                'and college football full-game winner, spread and total'
             ),
             'markets': [
                 {k: m.get(k) for k in fields}
@@ -983,7 +1224,6 @@ def main():
         json.dumps(out, separators=(',', ':')),
         encoding='utf-8'
     )
-
     print(
         'Kalshi:', len(markets),
         'BettingPros:', out['bettingpros']['status'],
