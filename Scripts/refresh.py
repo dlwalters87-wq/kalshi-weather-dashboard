@@ -110,7 +110,7 @@ def rows(data, key):
 
 def fetch(url, headers=None):
     request = Request(url, headers={
-        'User-Agent': 'KalshiResearchDashboard/8.0',
+        'User-Agent': 'KalshiResearchDashboard/9.0',
         **(headers or {})
     })
     with urlopen(request, timeout=35) as response:
@@ -262,34 +262,346 @@ def threshold_matches(market, line):
     return False
 
 
-def discover_college_series():
-    found = {}
-    info = {'supported_series': [], 'status': 'not_checked'}
-    names = {}
+COLLEGE_SERIES = {
+    'KXNCAAFGAME': ('NCAAF', 'moneyline'),
+    'KXNCAAFSPREAD': ('NCAAF', 'spread'),
+    'KXNCAAFTOTAL': ('NCAAF', 'total'),
+}
 
-    for stat in ('passing yards', 'receiving yards', 'rushing yards', 'receptions'):
-        for prefix in ('college football', 'ncaa football', 'ncaaf'):
-            names[prefix + ' ' + stat] = stat
-            names[prefix + ' player ' + stat] = stat
 
+def team_names(event, ident):
+    names = set()
+    for p in rows(event, 'participants'):
+        if str(p.get('id')) != str(ident):
+            continue
+        team = p.get('team') or {}
+        for value in (p.get('name'), team.get('city'), team.get('slug'),
+                      str(team.get('city') or '') + ' ' + str(p.get('name') or '')):
+            if value:
+                names.add(norm(value).replace(' st ', ' state '))
+    return names
+
+
+def college_team_name(value):
+    value = norm(value)
+    return re.sub(r'\bst\b', 'state', value)
+
+
+def college_event_check(event, market, today, now):
+    if event.get('sport') != 'NCAAF':
+        return 'wrong_sport'
+    start = timestamp(event.get('scheduled'), naive_utc=True)
+    if (event.get('status') not in ('scheduled', 'not_started', 'created')
+            or start is None or start <= now):
+        return 'not_verified_pregame'
+    if start.astimezone(EASTERN).date() != today or game_date(market) != today:
+        return 'date_mismatch'
+
+    # College abbreviations differ across providers; use exact team names in rules.
+    pair = re.search(
+        r'(?:in the|wins the) (.+?) vs\.? (.+?) college football game originally',
+        str(market.get('rules_primary') or ''), re.I
+    )
+    if not pair:
+        return 'rules_team_pair_unparsed'
+    a, b = map(college_team_name, pair.groups())
+    home = {college_team_name(n) for n in team_names(event, event.get('home'))}
+    away = {college_team_name(n) for n in team_names(event, event.get('visitor'))}
+    if not ((a in home and b in away) or (a in away and b in home)):
+        return 'team_names_mismatch'
+    if a == b or (a in home and a in away) or (b in home and b in away):
+        return 'ambiguous_team_names'
+    close = timestamp(market.get('close_time'))
+    return None if close and close > now else 'closed_or_missing_deadline'
+
+
+def college_selection_yes(kind, selection, event, market, line):
+    rules = str(market.get('rules_primary') or '')
+    if kind == 'total':
+        return (
+            norm(selection.get('selection')) == 'over'
+            and threshold_matches(market, line)
+        )
+    ident = selection.get('participant')
+    if ident is None or str(ident) not in (
+        str(event.get('home')), str(event.get('visitor'))
+    ):
+        return False
+    names = {college_team_name(n) for n in team_names(event, ident)}
+    if kind == 'moneyline':
+        match = re.match(r'If (.+?) wins the ', rules)
+        return bool(match and college_team_name(match[1]) in names)
+    match = re.match(
+        r'If (.+?) wins by more than ([0-9.]+) points in the ', rules
+    )
+    return bool(
+        match and college_team_name(match[1]) in names
+        and number(match[2]) == -line
+        and threshold_matches(market, -line)
+    )
+
+
+def scan_college(markets, key, today, now):
+    info = {
+        'mode': 'full_game_matchups', 'pages': 0, 'props': 0,
+        'events': 0, 'offers': 0, 'matches': 0, 'candidates': 0,
+        'requests': 0, 'more_pages': False, 'rejections': {},
+        'status': 'not_started'
+    }
+    reviews, rejects = [], Counter()
+    relevant = [(stat, m) for sport, stat, m in markets if sport == 'NCAAF']
+    if not relevant or not key:
+        info['status'] = (
+            'no_same_day_contracts' if not relevant else 'missing_api_key'
+        )
+        return reviews, info, None
+
+    # Reserve most of the shared 40-request budget for existing player scans.
+    def pages(endpoint, params, array):
+        page = 1
+        seen = set()
+        while True:
+            if info['requests'] >= 10:
+                info['more_pages'] = True
+                raise RuntimeError('college_budget_reached')
+            if info['requests']:
+                time.sleep(BP_DELAY_SECONDS)
+            info['requests'] += 1
+            data = fetch(
+                BP + '/' + endpoint + '?' + urlencode({
+                    **params, 'limit': 50, 'page': page
+                }),
+                {'x-api-key': key}
+            )
+            info['pages'] += 1
+            batch = rows(data, array)
+            digest = hashlib.sha256(
+                json.dumps(batch, sort_keys=True).encode()
+            ).hexdigest()
+            if batch and digest in seen:
+                raise ValueError('Repeated page')
+            seen.add(digest)
+            yield batch
+            pagination = data.get('_pagination') or {}
+            if not pagination.get('next'):
+                break
+            page += 1
+
+    stop = None
     try:
-        data = fetch(KALSHI + '/series?' + urlencode({'category': 'Sports'}))
-        for series in rows(data, 'series'):
-            title = norm(series.get('title'))
-            ticker = series.get('ticker')
-            if title in names and isinstance(ticker, str) and ticker:
-                found[ticker] = ('NCAAF', names[title])
+        definitions = {}
+        for batch in pages(
+            'markets',
+            {'sport': 'NCAAF', 'market_category': 'game-odds'},
+            'markets'
+        ):
+            for d in batch:
+                if d.get('period') == 'game' and d.get('category') == 'game-odds':
+                    kind = {
+                        'moneyline': 'moneyline',
+                        'spread': 'spread',
+                        'against-the-spread': 'spread',
+                        'total': 'total',
+                        'over-under': 'total'
+                    }.get(d.get('slug'))
+                    if kind and d.get('id') is not None:
+                        definitions[str(d['id'])] = kind
+
+        info['market_types'] = sorted(set(definitions.values()))
+        if not definitions:
+            info['status'] = 'full_game_definitions_missing'
+            info['more_pages'] = True
+            return reviews, info, None
+
+        events = []
+        for batch in pages(
+            'events',
+            {
+                'sport': 'NCAAF',
+                'start': today.isoformat(),
+                'end': (today + dt.timedelta(days=1)).isoformat()
+            },
+            'events'
+        ):
+            events.extend(batch)
+
+        info['events'] = len(events)
+        for event in events:
+            candidates = []
+            for kind, market in relevant:
+                reason = college_event_check(event, market, today, now)
+                if reason:
+                    rejects[reason] += 1
+                else:
+                    candidates.append((kind, market))
+            if not candidates:
+                rejects['no_verified_same_day_game'] += 1
+                continue
+
+            params = {
+                'sport': 'NCAAF',
+                'event_id': event['id'],
+                'market_id': ':'.join(definitions),
+                'live': 'false'
+            }
+            for batch in pages('offers', params, 'offers'):
+                info['offers'] += len(batch)
+                for offer in batch:
+                    kind = definitions.get(str(offer.get('market_id')))
+                    if (
+                        not kind or offer.get('active') is not True
+                        or str(offer.get('event_id')) != str(event['id'])
+                        or offer.get('player_id') not in (None, '')
+                        or offer.get('team_id') not in (None, '')
+                    ):
+                        continue
+
+                    for selection in rows(offer, 'selections'):
+                        if selection.get('active') is not True:
+                            continue
+
+                        # Use the consensus row rather than choosing the
+                        # most optimistic model estimate across books.
+                        for book in rows(selection, 'books'):
+                            if str(book.get('id')) != '0':
+                                continue
+
+                            for quote in rows(book, 'lines'):
+                                updated = timestamp(
+                                    quote.get('updated'), naive_utc=True
+                                )
+                                if (
+                                    quote.get('active') is not True
+                                    or quote.get('is_off') is not False
+                                    or quote.get('replaced') is True
+                                    or not updated
+                                    or not 0 <= (
+                                        now - updated
+                                    ).total_seconds() <= 3600
+                                ):
+                                    rejects['inactive_or_stale_quote'] += 1
+                                    continue
+
+                                probability = number(
+                                    (quote.get('metrics') or {}).get(
+                                        'cover_probability'
+                                    )
+                                )
+                                line = number(quote.get('line'))
+                                if (
+                                    probability is None
+                                    or not 0 < probability < 1
+                                ):
+                                    rejects['model_probability_missing'] += 1
+                                    continue
+
+                                if kind != 'moneyline' and (
+                                    line is None
+                                    or abs(
+                                        line - math.floor(line) - .5
+                                    ) > .001
+                                ):
+                                    rejects['non_half_point_line'] += 1
+                                    continue
+
+                                for market_kind, market in candidates:
+                                    if (
+                                        market_kind != kind
+                                        or not college_selection_yes(
+                                            kind, selection, event,
+                                            market, line
+                                        )
+                                    ):
+                                        continue
+
+                                    info['matches'] += 1
+                                    for side, field, prob in [
+                                        (
+                                            'YES', 'yes_ask_dollars',
+                                            probability
+                                        ),
+                                        (
+                                            'NO', 'no_ask_dollars',
+                                            1 - probability
+                                        )
+                                    ]:
+                                        ask = number(market.get(field))
+                                        if ask is None or not 0 < ask < 1:
+                                            continue
+
+                                        edge = prob - ask - BUFFER
+                                        if edge <= MIN_EDGE:
+                                            rejects[
+                                                'edge_below_requirement'
+                                            ] += 1
+                                            continue
+
+                                        reviews.append({
+                                            'ticker': market['ticker'],
+                                            'title': market.get('title'),
+                                            'side': side,
+                                            'ask': round(ask, 4),
+                                            'model_probability': round(
+                                                prob, 4
+                                            ),
+                                            'edge_after_buffer': round(
+                                                edge, 4
+                                            ),
+                                            'close_time': market.get(
+                                                'close_time'
+                                            ),
+                                            'volume': market.get('volume_fp'),
+                                            'scheduled_game_date': (
+                                                today.isoformat()
+                                            ),
+                                            'match': {
+                                                'sport': 'NCAAF',
+                                                'stat': kind,
+                                                'line': line,
+                                                'period': 'game',
+                                                'event_check': (
+                                                    'exact team names '
+                                                    'and date matched'
+                                                ),
+                                                'probability_source': (
+                                                    'BettingPros consensus '
+                                                    'cover_probability'
+                                                ),
+                                                'quote_updated': quote.get(
+                                                    'updated'
+                                                )
+                                            },
+                                            'warning': (
+                                                'Research only: verify '
+                                                'settlement exceptions, '
+                                                'fees, liquidity and '
+                                                'model freshness.'
+                                            )
+                                        })
 
         info['status'] = (
-            'supported_player_series_found'
-            if found else 'no_supported_player_series'
+            'scanned' if info['offers'] else 'no_verified_matchup_offers'
         )
-        info['supported_series'] = sorted(found)
     except Exception as ex:
-        info['status'] = 'discovery_failed'
-        info['error'] = error_label(ex)
+        label = (
+            'college_request_budget_reached'
+            if str(ex) == 'college_budget_reached'
+            else error_label(ex)
+        )
+        info.update({
+            'status': 'partial',
+            'error': label,
+            'more_pages': True
+        })
+        if label in (
+            'daily_quota_exhausted', 'rate_limited',
+            'HTTP_401', 'HTTP_403'
+        ):
+            stop = label
 
-    return found, info
+    info['candidates'] = len({r['ticker'] for r in reviews})
+    info['rejections'] = dict(rejects)
+    return reviews, info, stop
 
 
 def main():
@@ -299,9 +611,7 @@ def main():
     rejected, unknown = Counter(), Counter()
     markets, errors = [], []
 
-    college_series, college_info = discover_college_series()
-    SERIES.update(college_series)
-    debug['college_football'] = college_info
+    SERIES.update(COLLEGE_SERIES)
 
     for series, (sport, stat) in SERIES.items():
         cursor, seen = None, set()
@@ -341,11 +651,17 @@ def main():
         for sport, stat, m in markets if m.get('ticker')
     }.values())
 
-    # Always query NCAAF so its projection coverage is visible.
-    active_sports = sorted({sport for sport, _, _ in markets} | {'NCAAF'})
+    active_sports = sorted({sport for sport, _, _ in markets} - {'NCAAF'})
     props, definitions, events = [], {}, {}
     pending, seen_urls, seen_pages = {}, set(), set()
     key = os.getenv('BETTINGPROS_API_KEY', '').strip()
+
+    college_review, college_info, college_stop = scan_college(
+        markets, key, today, now
+    )
+    debug['college_football'] = college_info
+    if college_info.get('error'):
+        errors.append('NCAAF: ' + college_info['error'])
 
     for sport in active_sports:
         pending[sport] = BP + '/props?' + urlencode({
@@ -358,8 +674,8 @@ def main():
             'pages': 0, 'props': 0, 'more_pages': True
         }
 
-    calls = 0
-    stop_reason = 'missing_api_key' if not key else None
+    calls = college_info['requests']
+    stop_reason = 'missing_api_key' if not key else college_stop
 
     while pending and not stop_reason and calls < BP_REQUEST_BUDGET:
         for sport in list(pending):
@@ -433,13 +749,16 @@ def main():
     scanner = {
         'status': 'insufficient_data', 'scanned_props': len(props),
         'usable_projections': 0, 'stats_identified': 0,
-        'matches_checked': 0, 'review': []
+        'matches_checked': college_info['matches'], 'review': []
     }
-    review, event_examples = [], []
+    review, event_examples = list(college_review), []
 
     supported = set(SERIES.values()) | {
         ('NCAAF', stat)
-        for stat in ('passing yards', 'receiving yards', 'rushing yards', 'receptions')
+        for stat in (
+            'passing yards', 'receiving yards',
+            'rushing yards', 'receptions'
+        )
     }
 
     for sport, p in props:
@@ -449,7 +768,11 @@ def main():
 
         side = str(projection.get('recommended_side') or '').lower()
         probability = number(projection.get('probability'))
-        if side not in ('over', 'under') or probability is None or not 0 < probability < 1:
+        if (
+            side not in ('over', 'under')
+            or probability is None
+            or not 0 < probability < 1
+        ):
             rejected['projection_unusable'] += 1
             continue
 
@@ -474,11 +797,20 @@ def main():
 
         scanner['stats_identified'] += 1
         participant = p.get('participant') or {}
-        player = norm(participant.get('name')) if isinstance(participant, dict) else ''
+        player = (
+            norm(participant.get('name'))
+            if isinstance(participant, dict) else ''
+        )
         selected = p.get(side)
-        line = number(selected.get('line')) if isinstance(selected, dict) else None
+        line = (
+            number(selected.get('line'))
+            if isinstance(selected, dict) else None
+        )
 
-        if len(player.split()) < 2 or line is None or abs(line - math.floor(line) - 0.5) > 0.001:
+        if (
+            len(player.split()) < 2 or line is None
+            or abs(line - math.floor(line) - 0.5) > 0.001
+        ):
             rejected['player_or_line_unusable'] += 1
             continue
 
@@ -576,7 +908,7 @@ def main():
     scanner['debug'] = debug
 
     incomplete = (
-        bool(stop_reason) or bool(errors)
+        bool(stop_reason) or bool(errors) or college_info['more_pages']
         or any(info['more_pages'] for info in debug['sports'].values())
     )
 
@@ -585,11 +917,10 @@ def main():
         if unique else 'No candidate passed the verification checks.'
     )
 
-    if not college_series:
-        summary += (
-            ' NCAAF scanning enabled; no supported Kalshi '
-            'college-player series was confirmed.'
-        )
+    summary += (
+        ' College football game matchups: '
+        + college_info['status'] + '.'
+    )
 
     if incomplete:
         summary += (
@@ -618,13 +949,16 @@ def main():
     )
 
     out = {
-        'version': 8,
+        'version': 9,
         'updated_utc': now.isoformat(),
         'kalshi': {
             'status': 'partial' if kalshi_incomplete else 'ok',
             'market_count': len(markets),
             'more_pages': kalshi_incomplete,
-            'scope': 'Selected player props explicitly scheduled today in contract rules',
+            'scope': (
+                'Same-day player props and college football '
+                'full-game winner, spread and total'
+            ),
             'markets': [
                 {k: m.get(k) for k in fields}
                 for _, _, m in markets
@@ -637,7 +971,7 @@ def main():
             ),
             'successful_queries': sum(
                 info['pages'] > 0 for info in debug['sports'].values()
-            ),
+            ) + int(college_info['pages'] > 0),
             'market_labels': len(definitions),
             'errors': errors
         },
